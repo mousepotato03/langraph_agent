@@ -1,26 +1,2 @@
-# LangChain & LangGraph
-langchain
-langchain-openai
-langgraph
-langchain-community
-langchain-huggingface
-
-# Vector DB & Embeddings
-chromadb
-sentence-transformers
-
-# API & Web
-fastapi
-uvicorn[standard]
-gradio
-python-dotenv
-
-# Google Search
-google-api-python-client
-
-# PDF Processing
-pypdf
-
-# Utilities
-pydantic
-python-multipart
+# Compatibility install; uv sync --all-extras uses the exact uv.lock versions.
+-e .[ui,rag,search]

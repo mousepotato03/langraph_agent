@@ -1,7 +1,7 @@
 """
 Time Tools - 시간 및 최신성 확인 도구
 """
-from typing import Dict
+
 from datetime import datetime
 
 from langchain_core.tools import tool
@@ -48,7 +48,7 @@ def get_current_time() -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def check_freshness_simple(updated_date: str) -> Dict:
+def check_freshness_simple(updated_date: str) -> dict:
     """
     최신 여부를 간단히 확인 (내부 함수)
 
@@ -63,11 +63,7 @@ def check_freshness_simple(updated_date: str) -> Dict:
         return {
             "is_fresh": days_old <= 30,
             "days_old": days_old,
-            "message": "최신" if days_old <= 30 else "확인 필요"
+            "message": "최신" if days_old <= 30 else "확인 필요",
         }
-    except:
-        return {
-            "is_fresh": False,
-            "days_old": -1,
-            "message": "날짜 형식 오류"
-        }
+    except ValueError:
+        return {"is_fresh": False, "days_old": -1, "message": "날짜 형식 오류"}

@@ -1,127 +1,70 @@
-"""
-Recommend Tool Node - ReAct 에이전트 도구 추천
-"""
+"""Recommend per task, keeping evidence and ReAct messages isolated between tasks."""
+
 import json
-import uuid
-from typing import Dict
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from agent.dependencies import AgentDependencies
 from agent.state import AgentState
-from core.llm import get_llm
 from core.config import MAX_TOOL_CALLS_PER_TASK
-from tools.registry import get_all_tools
-from prompts.recommend import RECOMMEND_TOOL_SYSTEM_PROMPT, RECOMMEND_TOOL_USER_TEMPLATE
 from prompts.formatters import format_user_profile
+from prompts.recommend import RECOMMEND_TOOL_SYSTEM_PROMPT, RECOMMEND_TOOL_USER_TEMPLATE
+from tools.registry import get_all_tools
 
 
-def recommend_tool_node(state: AgentState) -> Dict:
-    """
-    [작업 3, 4] ReAct Agent - 도구 추천
+def finish_task(state: AgentState, recommendation: str) -> dict:
+    recommendations = dict(state["tool_recommendations"])
+    recommendations[f"task_{state['current_task_idx'] + 1}"] = recommendation
+    return {
+        "tool_recommendations": recommendations,
+        "current_task_idx": state["current_task_idx"] + 1,
+        "tool_call_count": 0,
+        "pending_tool_calls": [],
+        "task_messages": [],
+        "task_documents": [],
+        "task_recommendation": None,
+    }
 
-    각 서브태스크에 대해 도구를 호출하여 최적의 AI 도구를 추천합니다.
-    """
-    print("[Node] recommend_tool 실행")
 
-    sub_tasks = state.get("sub_tasks", [])
-    current_idx = state.get("current_task_idx", 0)
-    tool_call_count = state.get("tool_call_count", 0)
-    tool_recommendations = state.get("tool_recommendations", {})
-    retrieved_docs = state.get("retrieved_docs", [])
-    user_profile = state.get("user_profile")
+def recommend_tool_node(state: AgentState, *, deps: AgentDependencies) -> dict:
+    if state["current_task_idx"] >= len(state["sub_tasks"]):
+        return {"pending_tool_calls": []}
+    recommended = state["task_recommendation"]
+    if recommended:
+        score = recommended.get("scores", {}).get("final_score", 0)
+        result = (
+            f"**{recommended.get('name', '이름 없음')}** (검색 점수: {score:.2f})\n"
+            f"{recommended.get('description', '')}"
+        )
+        return finish_task(state, result)
 
-    # 이전 태스크 완료 처리 (executor에서 task_completed=True 설정한 경우)
-    if state.get("task_completed", False):
-        task_id = f"task_{current_idx + 1}"
-        print(f"  - 이전 태스크 완료 처리: {task_id}")
-
-        # 마지막 검색 결과에서 추천 도구 정보 추출
-        if retrieved_docs:
-            last_doc = retrieved_docs[-1]
-            tool_name = last_doc.get("name", "알 수 없음")
-            description = last_doc.get("description", "")
-            scores = last_doc.get("scores", {})
-            final_score = scores.get("final_score", 0)
-
-            recommendation = f"**{tool_name}** (점수: {final_score:.2f})\n{description}"
-            print(f"  - 추천 저장: {tool_name}")
-        else:
-            recommendation = "검색 결과 기반 추천"
-
-        tool_recommendations[task_id] = recommendation
-
-        return {
-            "tool_recommendations": tool_recommendations,
-            "current_task_idx": current_idx + 1,
-            "task_completed": False  # 플래그 초기화
-        }
-
-    # 모든 태스크 완료 체크
-    if current_idx >= len(sub_tasks):
-        print("  - 모든 서브태스크 처리 완료")
-        return {"tool_result": None}
-
-    current_task = sub_tasks[current_idx]
-    print(f"  - 현재 태스크: {current_task} ({current_idx + 1}/{len(sub_tasks)})")
-
-    # 무한 루프 방지
-    if tool_call_count >= MAX_TOOL_CALLS_PER_TASK:
-        print(f"  - 최대 도구 호출 횟수 도달 ({MAX_TOOL_CALLS_PER_TASK}), 다음 태스크로 이동")
-        task_id = f"task_{current_idx + 1}"
-        tool_recommendations[task_id] = "도구 검색 결과를 바탕으로 직접 확인이 필요합니다."
-        return {
-            "tool_result": None,
-            "tool_recommendations": tool_recommendations,
-            "current_task_idx": current_idx + 1,
-            "tool_call_count": 0
-        }
-
-    # LLM에 도구 바인딩
-    tools = get_all_tools()
-    llm_with_tools = get_llm(temperature=0.3).bind_tools(tools)
-
-    # 이전 검색 결과 컨텍스트
-    previous_results = ""
-    if retrieved_docs:
-        recent_docs = retrieved_docs[-5:]  # 최근 5개
-        previous_results = json.dumps(recent_docs, ensure_ascii=False, indent=2)
-
-    user_prompt = RECOMMEND_TOOL_USER_TEMPLATE.format(
-        current_task=current_task,
-        previous_results=previous_results if previous_results else "없음",
-        user_profile=format_user_profile(user_profile)
+    llm = deps.llm_factory(temperature=0.3)
+    prompt = RECOMMEND_TOOL_USER_TEMPLATE.format(
+        current_task=state["sub_tasks"][state["current_task_idx"]],
+        previous_results=json.dumps(state["task_documents"], ensure_ascii=False),
+        user_profile=format_user_profile(state["user_profile"]),
     )
-
-    response = llm_with_tools.invoke([
+    messages = [
         SystemMessage(content=RECOMMEND_TOOL_SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt)
-    ])
-
-    # Tool Call 확인
-    if response.tool_calls:
-        tool_call = response.tool_calls[0]
-        print(f"  - Tool Call: {tool_call['name']}")
-        print(f"  - Args: {tool_call['args']}")
-
-        return {
-            "tool_result": json.dumps({
-                "id": tool_call.get("id", str(uuid.uuid4())),
-                "name": tool_call["name"],
-                "arguments": tool_call["args"]
-            }),
-            "tool_call_count": tool_call_count + 1,
-            "messages": [response]
-        }
+        HumanMessage(content=prompt),
+        *state["task_messages"],
+    ]
+    if state["tool_call_count"] >= MAX_TOOL_CALLS_PER_TASK:
+        messages.append(
+            HumanMessage(
+                content=(
+                    "도구 호출 한도에 도달했습니다. 수집한 근거로 추천을 마무리하고, "
+                    "적합한 도구를 찾지 못했으면 추가 확인이 필요하다고 밝혀주세요."
+                )
+            )
+        )
+        response = llm.invoke(messages)
     else:
-        # Tool Call 없이 추천 완료 -> 다음 태스크로
-        print(f"  - 추천 완료, 다음 태스크로 이동")
-        task_id = f"task_{current_idx + 1}"
-        tool_recommendations[task_id] = response.content
-
+        response = llm.bind_tools(get_all_tools(), parallel_tool_calls=False).invoke(messages)
+    if response.tool_calls:
         return {
-            "tool_result": None,
-            "tool_recommendations": tool_recommendations,
-            "current_task_idx": current_idx + 1,
-            "tool_call_count": 0,
-            "messages": [response]
+            "pending_tool_calls": response.tool_calls,
+            "task_messages": [*state["task_messages"], response],
+            "messages": [response],
         }
+    return {**finish_task(state, response.content), "messages": [response]}

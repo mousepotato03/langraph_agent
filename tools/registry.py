@@ -1,17 +1,15 @@
-"""
-Tool Registry - 도구 등록 및 실행
-"""
-from typing import List, Any
+"""One registry is used both for model binding and execution."""
 
-from tools.search import retrieve_docs, google_search_tool
+from langchain_core.tools import BaseTool
+
+from tools.calculator import calculate_math, calculate_subscription_cost
 from tools.memory_tools import read_memory, write_memory
-from tools.calculator import calculate_subscription_cost, calculate_math
+from tools.search import google_search_tool, retrieve_docs
 from tools.time_tools import check_tool_freshness, get_current_time
 
-
-def get_all_tools() -> List:
-    """LangChain 도구 리스트 반환 (LLM 바인딩용)"""
-    return [
+TOOLS: dict[str, BaseTool] = {
+    item.name: item
+    for item in (
         retrieve_docs,
         read_memory,
         write_memory,
@@ -19,33 +17,29 @@ def get_all_tools() -> List:
         calculate_subscription_cost,
         calculate_math,
         check_tool_freshness,
-        get_current_time
-    ]
-
-
-def execute_tool(tool_name: str, args: dict) -> Any:
-    """
-    도구 이름으로 실행
-
-    Args:
-        tool_name: 도구 이름
-        args: 도구 인자 딕셔너리
-
-    Returns:
-        도구 실행 결과
-    """
-    tools_map = {
-        "retrieve_docs": retrieve_docs,
-        "read_memory": read_memory,
-        "write_memory": write_memory,
-        "google_search_tool": google_search_tool,
-        "calculate_subscription_cost": calculate_subscription_cost,
-        "calculate_math": calculate_math,
-        "check_tool_freshness": check_tool_freshness,
-        "get_current_time": get_current_time
+        get_current_time,
+    )
+}
+SIMPLE_TOOL_NAMES = frozenset(
+    {
+        "get_current_time",
+        "google_search_tool",
+        "calculate_math",
+        "calculate_subscription_cost",
+        "check_tool_freshness",
     }
+)
 
-    tool_func = tools_map.get(tool_name)
-    if tool_func:
-        return tool_func.invoke(args)
-    raise ValueError(f"알 수 없는 도구: {tool_name}")
+
+def get_all_tools() -> list[BaseTool]:
+    return list(TOOLS.values())
+
+
+def get_simple_tools() -> list[BaseTool]:
+    return [item for name, item in TOOLS.items() if name in SIMPLE_TOOL_NAMES]
+
+
+def execute_tool(tool_name: str, args: dict):
+    if tool_name not in TOOLS:
+        raise ValueError(f"알 수 없는 도구: {tool_name}")
+    return TOOLS[tool_name].invoke(args)

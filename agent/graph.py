@@ -1,138 +1,99 @@
-"""
-Agent Graph - LangGraph 그래프 빌드 및 실행
-"""
-import uuid
-from typing import Dict, Optional, List
+"""Build the graph independently of API/UI session handling."""
 
-from langchain_core.messages import HumanMessage, BaseMessage
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from functools import partial
 
-from agent.state import AgentState
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, StateGraph
+
+from agent.dependencies import AgentDependencies
 from agent.nodes import (
+    guide_generation_node,
+    human_approval_node,
     llm_router_node,
     planning_node,
-    human_approval_node,
     recommend_tool_node,
-    tool_executor_node,
-    guide_generation_node,
     reflection_node,
     simple_llm_node,
-    simple_tool_executor
+    simple_tool_executor,
+    tool_executor_node,
 )
-from agent.routing import route_after_llm_router, route_after_recommend, route_after_simple_llm
-from agent.hitl import handle_human_feedback
+from agent.routing import (
+    route_after_approval,
+    route_after_llm_router,
+    route_after_recommend,
+    route_after_simple_llm,
+)
+from agent.state import AgentState
 
 
 def create_initial_state(
     user_query: str,
     user_id: str = "default_user",
-    chat_history: List[BaseMessage] = None
+    chat_history: list[BaseMessage] | None = None,
 ) -> AgentState:
-    """초기 상태 생성
-
-    Args:
-        user_query: 현재 사용자 질문
-        user_id: 사용자 ID
-        chat_history: 이전 대화 히스토리 (단기 메모리)
-    """
-    # 이전 대화 히스토리 + 새 질문
-    messages = list(chat_history) if chat_history else []
-    messages.append(HumanMessage(content=user_query))
-
     return {
-        "messages": messages,
-        "tool_result": None,
-        "is_complex_task": False,
-        "sub_tasks": [],
-        "tool_recommendations": {},
-        "user_feedback": None,
-        "retrieved_docs": [],
-        "final_guide": None,
+        "messages": [*(chat_history or []), HumanMessage(content=user_query)],
         "user_id": user_id,
         "user_query": user_query,
         "user_profile": None,
+        "is_complex_task": False,
+        "sub_tasks": [],
         "plan_analysis": "",
+        "approval_status": "pending",
+        "approval_message": "계획을 검토하고 승인·수정·취소를 선택해주세요.",
+        "user_feedback": None,
         "current_task_idx": 0,
+        "tool_recommendations": {},
+        "pending_tool_calls": [],
         "tool_call_count": 0,
-        "task_completed": False,
         "simple_tool_count": 0,
+        "task_messages": [],
+        "task_documents": [],
+        "task_recommendation": None,
+        "retrieved_docs": [],
+        "final_guide": None,
         "final_answer": None,
-        "error": None
     }
 
 
-def create_agent_graph():
-    """LangGraph 에이전트 그래프 생성"""
-
-    # 그래프 정의
+def create_agent_graph(dependencies: AgentDependencies | None = None, *, checkpointer=None):
+    dependencies = dependencies or AgentDependencies()
     workflow = StateGraph(AgentState)
+    nodes = {
+        "llm_router": llm_router_node,
+        "planning_node": planning_node,
+        "human_approval_node": human_approval_node,
+        "recommend_tool_node": recommend_tool_node,
+        "tool_executor": tool_executor_node,
+        "guide_generation_node": guide_generation_node,
+        "reflection_node": reflection_node,
+        "simple_llm_node": simple_llm_node,
+        "simple_executor": simple_tool_executor,
+    }
+    for name, node in nodes.items():
+        workflow.add_node(name, partial(node, deps=dependencies))
 
-    # ===== 노드 추가 =====
-    workflow.add_node("llm_router", llm_router_node)
-    workflow.add_node("planning_node", planning_node)
-    workflow.add_node("human_approval_node", human_approval_node)
-    workflow.add_node("recommend_tool_node", recommend_tool_node)
-    workflow.add_node("tool_executor", tool_executor_node)
-    workflow.add_node("guide_generation_node", guide_generation_node)
-    workflow.add_node("reflection_node", reflection_node)
-
-    # ===== 단순 질문용 ReAct 노드 =====
-    workflow.add_node("simple_llm_node", simple_llm_node)
-    workflow.add_node("simple_executor", simple_tool_executor)
-
-    # ===== Entry Point =====
     workflow.set_entry_point("llm_router")
-
-    # ===== llm_router 분기 =====
     workflow.add_conditional_edges(
-        "llm_router",
-        route_after_llm_router,
-        {
-            "planning_node": "planning_node",
-            "simple_llm_node": "simple_llm_node"  # 단순 질문 -> ReAct 패턴
-        }
+        "llm_router", route_after_llm_router, ["planning_node", "simple_llm_node"]
     )
-
-    # ===== 단순 질문 ReAct 루프 =====
     workflow.add_conditional_edges(
-        "simple_llm_node",
-        route_after_simple_llm,
-        {
-            "simple_executor": "simple_executor",
-            "reflection_node": "reflection_node"
-        }
+        "simple_llm_node", route_after_simple_llm, ["simple_executor", "reflection_node"]
     )
-    workflow.add_edge("simple_executor", "simple_llm_node")  # 루프백
-
-    # ===== planning -> human_approval -> recommend =====
+    workflow.add_edge("simple_executor", "simple_llm_node")
     workflow.add_edge("planning_node", "human_approval_node")
-    workflow.add_edge("human_approval_node", "recommend_tool_node")
-
-    # ===== ReAct 루프 =====
+    workflow.add_conditional_edges(
+        "human_approval_node",
+        route_after_approval,
+        ["recommend_tool_node", "human_approval_node", END],
+    )
     workflow.add_conditional_edges(
         "recommend_tool_node",
         route_after_recommend,
-        {
-            "tool_executor": "tool_executor",
-            "recommend_tool_node": "recommend_tool_node",
-            "guide_generation_node": "guide_generation_node"
-        }
+        ["tool_executor", "recommend_tool_node", "guide_generation_node"],
     )
-
-    # tool_executor -> recommend_tool_node (Loop back)
     workflow.add_edge("tool_executor", "recommend_tool_node")
-
-    # ===== 마무리 =====
     workflow.add_edge("guide_generation_node", "reflection_node")
     workflow.add_edge("reflection_node", END)
-
-    # ===== 컴파일 =====
-    checkpointer = MemorySaver()
-
-    graph = workflow.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["human_approval_node"]  # planning 후 interrupt (ReAct 루프에 영향 없음)
-    )
-
-    return graph
+    return workflow.compile(checkpointer=checkpointer or InMemorySaver())

@@ -1,42 +1,51 @@
-"""
-API Schemas - Pydantic 모델 정의
-"""
-from typing import Optional, List, Dict
-from pydantic import BaseModel
+"""Validated API requests and explicit conversation statuses."""
+
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChatRequest(BaseModel):
-    """채팅 시작 요청"""
-    query: str
-    user_id: str = "default_user"
-    thread_id: Optional[str] = None
+    query: str = Field(min_length=1, max_length=10000)
+    user_id: str = Field(default="default_user", min_length=1, max_length=200)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def nonblank(self):
+        if not self.query.strip() or not self.user_id.strip():
+            raise ValueError("query and user_id must not be blank")
+        return self
 
 
 class ApproveRequest(BaseModel):
-    """계획 승인 요청"""
-    thread_id: str
-    action: str = "approve"  # approve, modify, cancel
-    feedback: Optional[str] = None
+    thread_id: str = Field(min_length=1, max_length=200)
+    user_id: str = Field(default="default_user", min_length=1, max_length=200)
+    action: Literal["approve", "modify", "cancel"]
+    feedback: str | None = Field(default=None, max_length=10000)
+
+    @model_validator(mode="after")
+    def modification_requires_feedback(self):
+        if self.action == "modify" and (not self.feedback or not self.feedback.strip()):
+            raise ValueError("modify requires nonblank feedback")
+        return self
 
 
 class TaskItem(BaseModel):
-    """태스크 항목"""
     id: str
     description: str
 
 
 class ChatResponse(BaseModel):
-    """채팅 응답"""
     thread_id: str
-    status: str
+    status: Literal["pending_approval", "completed", "cancelled"]
     message: str
     is_complex: bool = False
-    plan: Optional[List[TaskItem]] = None
-    final_guide: Optional[str] = None
+    plan: list[TaskItem] | None = None
+    # Kept for API compatibility: contains the final answer from either branch.
+    final_guide: str | None = None
 
 
 class HealthResponse(BaseModel):
-    """헬스 체크 응답"""
     status: str
     tools_count: int
     profiles_count: int

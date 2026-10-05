@@ -1,250 +1,137 @@
-"""
-Gradio UI - 채팅 인터페이스
-"""
-import uuid
-from typing import Dict, List
+"""Gradio rendering and a testable controller; graph execution lives in AgentService."""
 
-import gradio as gr
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+import logging
+from uuid import uuid4
 
-from agent.graph import create_agent_graph, create_initial_state
-from agent.hitl import handle_human_feedback
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
+from app.service import AgentService, ServiceError
 from core.memory import get_memory_manager
 
+logger = logging.getLogger(__name__)
 
-def convert_history_to_messages(history: List[Dict]) -> List[BaseMessage]:
-    """Gradio history를 LangGraph messages로 변환 (단기 메모리)"""
+
+def convert_history_to_messages(history: list[dict]) -> list[BaseMessage]:
     messages = []
-    for msg in history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        else:
-            messages.append(AIMessage(content=msg["content"]))
+    for item in history:
+        content = item.get("content", "")
+        # Gradio 6 preprocesses text into typed content blocks.
+        if isinstance(content, list):
+            content = "\n".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        if not isinstance(content, str):
+            continue
+        if item.get("role") == "user":
+            messages.append(HumanMessage(content=content))
+        elif item.get("role") == "assistant":
+            messages.append(AIMessage(content=content))
     return messages
 
 
-def create_gradio_ui(active_sessions: Dict):
-    """Gradio 채팅 인터페이스 생성 - 완전 자연어 방식"""
+class ChatController:
+    def __init__(self, service: AgentService):
+        self.service = service
 
-    def process_message(message: str, history: list, user_id: str, thread_id: str):
-        """
-        통합 메시지 처리
-        - 세션 없음: 새 대화 시작 (Plan 생성)
-        - 세션 있음: 계획에 대한 자연어 응답 처리
-        """
+    def process_message(
+        self, message: str, history: list | None, user_id: str, thread_id: str | None
+    ):
+        history = list(history or [])
         if not message.strip():
             return history, thread_id, "메시지를 입력해주세요."
-
-        history = history or []
-
-        # 활성 세션이 있으면 → 계획에 대한 응답으로 처리
-        if thread_id and thread_id in active_sessions:
-            return continue_with_response(message, history, thread_id, active_sessions)
-
-        # 새 대화 시작
-        return start_new_conversation(message, history, user_id, active_sessions)
-
-    def start_new_conversation(message: str, history: list, user_id: str, sessions: Dict):
-        """새 대화 시작 - Plan 생성 또는 단순 Q&A 처리"""
-        thread_id = str(uuid.uuid4())
-
         try:
-            graph = create_agent_graph()
+            if thread_id:
+                result = self.service.respond(thread_id, user_id, message)
+            else:
+                result = self.service.start(
+                    message, user_id, chat_history=convert_history_to_messages(history)
+                )
+            text = result.final_guide or result.message
+            next_thread = result.thread_id if result.status == "pending_approval" else None
+            status = {
+                "pending_approval": "계획 검토 중 — 승인·수정·취소를 알려주세요.",
+                "completed": "완료",
+                "cancelled": "취소됨",
+            }[result.status]
+        except (ServiceError, ValueError) as error:
+            logger.warning("UI request failed", exc_info=True)
+            text = str(error)
+            next_thread = (
+                thread_id if thread_id and self.service.has_pending(thread_id, user_id) else None
+            )
+            status = "요청을 처리하지 못했습니다."
+        history.extend(
+            [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": text},
+            ]
+        )
+        return history, next_thread, status
 
-            # 그래프 이동 최대 횟수 지정
-            config = {"recursion_limit": 60, "configurable": {"thread_id": thread_id}}
-
-            # 이전 대화 히스토리를 messages로 변환 (단기 메모리)
-            chat_history = convert_history_to_messages(history)
-            initial_state = create_initial_state(message, user_id or "gradio_user", chat_history)
-
-            # 그래프 실행 (interrupt까지 또는 완료까지)
-            for event in graph.stream(initial_state, config):
-                pass
-
-            state = graph.get_state(config)
-            is_complex = state.values.get("is_complex_task", False)
-            sub_tasks = state.values.get("sub_tasks", [])
-            plan_analysis = state.values.get("plan_analysis", "")
-            final_guide = state.values.get("final_guide")
-            final_answer = state.values.get("final_answer")
-
-            # 히스토리 업데이트
-            history.append({"role": "user", "content": message})
-
-            # 단순 Q&A: 바로 응답 (is_complex가 False이면 계획 없이 바로 처리)
-            if not is_complex:
-                response = final_answer or "응답을 생성할 수 없습니다."
-                history.append({"role": "assistant", "content": response})
-                return history, None, "완료!"
-
-            # 복잡한 작업: 세션 저장 및 승인 대기
-            sessions[thread_id] = {
-                "graph": graph,
-                "config": config,
-                "state": state
-            }
-
-            # 계획 메시지 생성 (자연어 안내)
-            plan_text = f"**작업 분석**\n{plan_analysis}\n\n**수립된 계획:**\n"
-            for i, task in enumerate(sub_tasks, 1):
-                plan_text += f"- **task_{i}**: {task}\n"
-            plan_text += "\n이대로 진행할까요? (예: '좋아 진행해', '취소해', '2번은 빼줘' 등으로 응답)"
-
-            history.append({"role": "assistant", "content": plan_text})
-
-            return history, thread_id, "계획 검토 중 - 자연어로 응답해주세요"
-
-        except Exception as e:
-            history.append({"role": "user", "content": message})
-            history.append({"role": "assistant", "content": f"오류가 발생했습니다: {str(e)}"})
-            return history, None, f"오류: {str(e)}"
-
-    def continue_with_response(message: str, history: list, thread_id: str, sessions: Dict):
-        """계획에 대한 자연어 응답 처리"""
-        if thread_id not in sessions:
-            return history, None, "세션이 만료되었습니다. 새로 시작해주세요."
-
-        session = sessions[thread_id]
-        graph = session["graph"]
-        config = session["config"]
-
+    def clear_chat(self, thread_id: str | None, user_id: str):
         try:
-            # 히스토리에 사용자 메시지 추가
-            history.append({"role": "user", "content": message})
+            self.service.discard(thread_id, user_id)
+        except ServiceError as error:
+            # Keep the pending thread so a concurrent request is not abandoned.
+            return None, thread_id, str(error)
+        return [], None, "새 대화를 시작합니다."
 
-            # handle_human_feedback로 상태 업데이트
-            current_state = graph.get_state(config)
-            state_dict = dict(current_state.values)
-            updates = handle_human_feedback(state_dict, message)
 
-            # 취소인 경우
-            if updates.get("error") == "사용자 취소":
-                if thread_id in sessions:
-                    del sessions[thread_id]
-                history.append({"role": "assistant", "content": "작업이 취소되었습니다. 새로운 요청이 있으시면 말씀해주세요."})
-                return history, None, "취소됨"
+def create_gradio_ui(service: AgentService, memory_factory=get_memory_manager):
+    import gradio as gr
 
-            # 상태 업데이트 후 실행 재개
-            graph.update_state(config, updates)
-
-            for event in graph.stream(None, config):
-                pass
-
-            state = graph.get_state(config)
-            final_guide = state.values.get("final_guide", "")
-
-            # 세션 정리
-            if thread_id in sessions:
-                del sessions[thread_id]
-
-            # 완료된 경우
-            history.append({"role": "assistant", "content": final_guide})
-            return history, None, "완료!"
-
-        except Exception as e:
-            history.append({"role": "assistant", "content": f"오류: {str(e)}"})
-            return history, None, f"오류: {str(e)}"
-
-    # UI 구성
-    with gr.Blocks(
-        title="AI 101 - AI 도구 추천 에이전트"
-    ) as demo:
-
-        # 상태 변수
-        current_thread_id = gr.State(None)
-
-        gr.Markdown("""
-        # AI 101 - 지능형 AI 도구 추천 에이전트
-
-        AI 도구를 활용한 작업을 도와드립니다. 원하는 작업을 자연어로 설명해주세요!
-
-        **대화 예시:**
-        - "유튜브 쇼츠 미스테리 영상을 만들고 싶어"
-        - (계획 제시 후) "좋아 진행해" / "2번은 빼줘" / "취소할래"
-        """)
-
+    controller = ChatController(service)
+    with gr.Blocks(title="AI 101 - AI 도구 추천 에이전트") as demo:
+        current_thread = gr.State(None)
+        gr.Markdown(
+            "# AI 101\n원하는 작업을 설명하면 AI 도구를 추천하고 사용 가이드를 작성합니다.\n\n"
+            "복잡한 요청은 계획을 먼저 검토합니다. 수정한 계획은 다시 승인해주세요."
+        )
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(
-                    label="대화",
-                    height=500
-                )
-
+                chatbot = gr.Chatbot(label="대화", height=500)
                 with gr.Row():
-                    msg = gr.Textbox(
-                        label="메시지 입력",
-                        placeholder="AI 도구 추천을 요청하거나, 계획에 대해 응답하세요...",
+                    message = gr.Textbox(
+                        placeholder="예: 무료 도구로 유튜브 쇼츠를 만들고 싶어",
+                        show_label=False,
                         scale=4,
-                        show_label=False
                     )
-                    submit_btn = gr.Button("전송", variant="primary", scale=1)
-
+                    submit = gr.Button("전송", variant="primary")
             with gr.Column(scale=1):
-                gr.Markdown("### 설정")
-                user_id_input = gr.Textbox(
+                user_id = gr.Textbox(
                     label="사용자 ID",
-                    value="default_user",
-                    placeholder="사용자 ID"
+                    value=lambda: f"gradio_{uuid4().hex}",
+                    info="같은 ID를 사용하면 저장된 선호도를 이어서 사용합니다.",
                 )
-                status_text = gr.Textbox(
-                    label="상태",
-                    value="대기 중",
-                    interactive=False
-                )
+                status = gr.Textbox(label="상태", value="대기 중", interactive=False)
+                clear = gr.Button("새 대화")
+                tools_count = gr.Number(label="등록된 도구", value=0, interactive=False)
+                profiles_count = gr.Number(label="사용자 프로필", value=0, interactive=False)
+                refresh = gr.Button("통계 새로고침")
 
-                # 새 대화 버튼
-                new_chat_btn = gr.Button("새 대화", variant="secondary")
+        for event in (submit.click, message.submit):
+            event(
+                fn=controller.process_message,
+                inputs=[message, chatbot, user_id, current_thread],
+                outputs=[chatbot, current_thread, status],
+            ).then(fn=lambda: "", outputs=message)
 
-                gr.Markdown("### 통계")
-                with gr.Row():
-                    tools_count = gr.Number(label="등록된 도구", value=0, interactive=False)
-                    profiles_count = gr.Number(label="사용자 프로필", value=0, interactive=False)
+        def clear_chat(history, thread_id, identity):
+            cleared, next_thread, text = controller.clear_chat(thread_id, identity)
+            return history if cleared is None else cleared, next_thread, text
 
-                refresh_btn = gr.Button("새로고침")
-
-        # 이벤트 핸들러 (단일화)
-        submit_btn.click(
-            fn=process_message,
-            inputs=[msg, chatbot, user_id_input, current_thread_id],
-            outputs=[chatbot, current_thread_id, status_text]
-        ).then(
-            fn=lambda: "",
-            outputs=msg
-        )
-
-        msg.submit(
-            fn=process_message,
-            inputs=[msg, chatbot, user_id_input, current_thread_id],
-            outputs=[chatbot, current_thread_id, status_text]
-        ).then(
-            fn=lambda: "",
-            outputs=msg
+        clear.click(
+            fn=clear_chat,
+            inputs=[chatbot, current_thread, user_id],
+            outputs=[chatbot, current_thread, status],
         )
 
         def refresh_stats():
-            memory = get_memory_manager()
+            memory = memory_factory()
             return memory.get_tools_count(), memory.get_profiles_count()
 
-        refresh_btn.click(
-            fn=refresh_stats,
-            outputs=[tools_count, profiles_count]
-        )
-
-        # 새 대화 버튼 이벤트
-        def clear_chat():
-            """대화 초기화 (새 세션 시작)"""
-            return [], None, "새 대화 시작"
-
-        new_chat_btn.click(
-            fn=clear_chat,
-            outputs=[chatbot, current_thread_id, status_text]
-        )
-
-        # 초기 로드 시 통계 업데이트
-        demo.load(
-            fn=refresh_stats,
-            outputs=[tools_count, profiles_count]
-        )
-
+        refresh.click(fn=refresh_stats, outputs=[tools_count, profiles_count])
+        demo.load(fn=refresh_stats, outputs=[tools_count, profiles_count])
     return demo

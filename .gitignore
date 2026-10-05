@@ -54,3 +54,9 @@ logs/
 *.onnx
 
 .claude/
+
+# Local verification
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

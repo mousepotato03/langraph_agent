@@ -1,27 +1,29 @@
 """
 Memory Manager - ChromaDB 기반 벡터 저장소 및 사용자 프로필 관리
 """
-import json
-import os
+
 import glob
-from typing import List, Dict, Optional
+import json
+import logging
+import os
 from datetime import datetime
+from threading import Lock
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-import chromadb
-from sentence_transformers import SentenceTransformer
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from core.config import DB_PATH
+from core.categories import matches_category
+from core.config import DB_PATH, EMBEDDING_MODEL
+from core.llm import get_llm
+from core.utils import extract_json, merge_preferences
+from prompts.reflection import MEMORY_EXTRACTOR_SYSTEM_PROMPT, MEMORY_EXTRACTOR_USER_TEMPLATE
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
     """ChromaDB를 활용한 RAG 및 장기 메모리 관리 클래스"""
 
-    def __init__(self, persist_dir: str = None):
+    def __init__(self, persist_dir: str = None, *, client=None, embedding_model=None):
         """
         Args:
             persist_dir: ChromaDB 영구 저장소 경로
@@ -29,35 +31,40 @@ class MemoryManager:
         self.persist_dir = persist_dir or DB_PATH
 
         # ChromaDB 클라이언트 초기화 (Persistent)
-        self.client = chromadb.PersistentClient(path=self.persist_dir)
+        if client is None:
+            import chromadb
+
+            client = chromadb.PersistentClient(path=self.persist_dir)
+        self.client = client
 
         # 임베딩 모델 초기화 (다국어 지원)
-        self.embedding_model = SentenceTransformer(
-            'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
-        )
+        if embedding_model is None:
+            from sentence_transformers import SentenceTransformer
+
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        self.embedding_model = embedding_model
 
         # 컬렉션 초기화 (cosine distance 사용으로 유사도 계산 개선)
         self.tools_collection = self.client.get_or_create_collection(
             name="ai_tools",
-            metadata={"description": "AI tools knowledge base", "hnsw:space": "cosine"}
+            metadata={"description": "AI tools knowledge base", "hnsw:space": "cosine"},
         )
 
         self.profile_collection = self.client.get_or_create_collection(
-            name="user_profile",
-            metadata={"description": "User preferences and history"}
+            name="user_profile", metadata={"description": "User preferences and history"}
         )
 
         # PDF 지식베이스 컬렉션 (cosine distance 사용)
         self.pdf_collection = self.client.get_or_create_collection(
             name="pdf_knowledge",
-            metadata={"description": "PDF documents knowledge base", "hnsw:space": "cosine"}
+            metadata={"description": "PDF documents knowledge base", "hnsw:space": "cosine"},
         )
 
-    def _embed_text(self, text: str) -> List[float]:
+    def _embed_text(self, text: str) -> list[float]:
         """텍스트를 임베딩 벡터로 변환"""
         return self.embedding_model.encode(text).tolist()
 
-    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """여러 텍스트를 임베딩 벡터로 변환"""
         return self.embedding_model.encode(texts).tolist()
 
@@ -73,17 +80,17 @@ class MemoryManager:
         Returns:
             저장된 도구 수
         """
-        with open(json_path, 'r', encoding='utf-8') as f:
+        with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
-        tools = data.get('tools', [])
+        tools = data.get("tools", [])
         if not tools:
             return 0
 
         # 기존 데이터 확인 (중복 방지)
         existing_count = self.tools_collection.count()
         if existing_count > 0:
-            print(f"기존 {existing_count}개의 도구 데이터가 있습니다. 스킵합니다.")
+            logger.info("Reusing %s catalog tools", existing_count)
             return existing_count
 
         # 문서 준비
@@ -103,25 +110,27 @@ class MemoryManager:
             pricing_model = scores.get("pricing_model", "")
 
             # 검색 키워드와 매칭이 잘 되도록 다양한 표현 포함
-            doc_text = f"""{tool['name']} - {categories_text}
-{tool['description']}
+            doc_text = f"""{tool["name"]} - {categories_text}
+{tool["description"]}
 카테고리: {categories_text}
 적용 분야: {domains_text}
 가격: {pricing_notes}
-{tool['name']}은 {categories_text} 분야의 AI 도구입니다.""".strip()
+{tool["name"]}은 {categories_text} 분야의 AI 도구입니다.""".strip()
 
             documents.append(doc_text)
 
             # 메타데이터
-            metadatas.append({
-                "name": tool['name'],
-                "description": tool['description'],
-                "categories": categories_text,
-                "domains": domains_text,
-                "pricing_model": pricing_model,
-                "pricing_notes": pricing_notes,
-                "scores": json.dumps(scores, ensure_ascii=False)
-            })
+            metadatas.append(
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "categories": categories_text,
+                    "domains": domains_text,
+                    "pricing_model": pricing_model,
+                    "pricing_notes": pricing_notes,
+                    "scores": json.dumps(scores, ensure_ascii=False),
+                }
+            )
 
             # ID
             ids.append(f"tool_{idx}_{tool['name'].lower().replace(' ', '_')}")
@@ -130,22 +139,15 @@ class MemoryManager:
         embeddings = self._embed_texts(documents)
 
         self.tools_collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
+            documents=documents, embeddings=embeddings, metadatas=metadatas, ids=ids
         )
 
-        print(f"{len(tools)}개의 AI 도구 데이터를 로드했습니다.")
+        logger.info("Indexed %s catalog tools", len(tools))
         return len(tools)
 
     def search_tools(
-        self,
-        query: str,
-        k: int = 5,
-        threshold: float = 0.4,
-        category: Optional[str] = None
-    ) -> tuple[List[Dict], bool]:
+        self, query: str, k: int = 5, threshold: float = 0.4, category: str | None = None
+    ) -> tuple[list[dict], bool]:
         """
         AI 도구 검색 (RAG)
 
@@ -159,70 +161,90 @@ class MemoryManager:
             (검색 결과 리스트, fallback 필요 여부)
         """
         # 도구 데이터가 없으면 빈 리스트 반환 (HNSW 오류 방지)
-        if self.tools_collection.count() == 0:
+        count = self.tools_collection.count()
+        if count == 0:
             return [], True
+        if k < 1:
+            raise ValueError("k must be positive")
 
         # 쿼리 임베딩
         query_embedding = self._embed_text(query)
 
-        # 카테고리 필터 (categories는 쉼표로 구분된 문자열)
-        where_filter = {"categories": {"$contains": category}} if category else None
+        # Chroma metadata cannot apply $contains to our comma-separated string.
+        # Exact token matching also supports databases built by the original app.
+        where_filter = None
+        if category:
+            metadata = self.tools_collection.get(include=["metadatas"])["metadatas"]
+            matches = [
+                item["name"]
+                for item in metadata
+                if matches_category(item.get("categories", ""), category)
+            ]
+            if not matches:
+                return [], True
+            where_filter = {"name": {"$in": matches}}
+            count = len(matches)
 
         # ChromaDB 검색
         results = self.tools_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            where=where_filter
+            query_embeddings=[query_embedding], n_results=min(k, count), where=where_filter
         )
 
         # 결과 처리
         search_results = []
 
-        if results['documents'] and results['documents'][0]:
-            for idx, doc in enumerate(results['documents'][0]):
+        if results["documents"] and results["documents"][0]:
+            for idx, _doc in enumerate(results["documents"][0]):
                 # 거리 → 유사도 변환 (ChromaDB cosine distance 사용)
-                distance = results['distances'][0][idx] if results['distances'] else 1.0
+                distance = results["distances"][0][idx] if results["distances"] else 1.0
                 # cosine distance를 유사도로 변환: similarity = 1 - distance
                 # cosine distance 범위: 0 (동일) ~ 2 (반대), 일반적으로 0~1
                 similarity = max(0, 1 - distance)
 
-                metadata = results['metadatas'][0][idx] if results['metadatas'] else {}
+                metadata = results["metadatas"][0][idx] if results["metadatas"] else {}
+                try:
+                    catalog_scores = json.loads(metadata.get("scores", "{}"))
+                except (ValueError, TypeError):
+                    catalog_scores = {}
+                if not isinstance(catalog_scores, dict):
+                    catalog_scores = {}
 
-                search_results.append({
-                    "name": metadata.get("name", "Unknown"),
-                    "description": metadata.get("description", ""),
-                    "categories": metadata.get("categories", ""),
-                    "domains": metadata.get("domains", ""),
-                    "pricing_model": metadata.get("pricing_model", ""),
-                    "pricing_notes": metadata.get("pricing_notes", ""),
-                    "scores": metadata.get("scores", "{}"),
-                    "score": round(similarity, 3)
-                })
+                search_results.append(
+                    {
+                        "name": metadata.get("name", "Unknown"),
+                        "description": metadata.get("description", ""),
+                        "categories": metadata.get("categories", ""),
+                        "domains": metadata.get("domains", ""),
+                        "pricing_model": metadata.get("pricing_model", ""),
+                        "pricing_notes": metadata.get("pricing_notes", ""),
+                        "source_urls": catalog_scores.get("source_urls", []),
+                        "catalog_updated_at": catalog_scores.get("last_updated", ""),
+                        "scores": metadata.get("scores", "{}"),
+                        "score": round(similarity, 3),
+                    }
+                )
 
         # Fallback 필요 여부 판단
         if not search_results:
             should_fallback = True
         else:
-            top_score = max(r['score'] for r in search_results)
-            avg_score = sum(r['score'] for r in search_results) / len(search_results)
+            top_score = max(r["score"] for r in search_results)
+            avg_score = sum(r["score"] for r in search_results) / len(search_results)
             should_fallback = top_score < threshold or avg_score < 0.5
 
         return search_results, should_fallback
 
-    def get_tool_by_name(self, name: str) -> Optional[Dict]:
+    def get_tool_by_name(self, name: str) -> dict | None:
         """도구 이름으로 상세 정보 조회"""
-        results = self.tools_collection.get(
-            where={"name": name},
-            limit=1
-        )
+        results = self.tools_collection.get(where={"name": name}, limit=1)
 
-        if results['metadatas']:
-            return results['metadatas'][0]
+        if results["metadatas"]:
+            return results["metadatas"][0]
         return None
 
     # ==================== 사용자 프로필 관련 메서드 ====================
 
-    def load_user_profile(self, user_id: str) -> Optional[Dict]:
+    def load_user_profile(self, user_id: str) -> dict | None:
         """
         장기 메모리에서 사용자 프로필 로드
 
@@ -234,20 +256,19 @@ class MemoryManager:
         """
         try:
             results = self.profile_collection.get(
-                ids=[f"profile_{user_id}"],
-                include=["documents", "metadatas"]
+                ids=[f"profile_{user_id}"], include=["documents", "metadatas"]
             )
 
-            if results['documents'] and results['documents'][0]:
-                profile_json = results['documents'][0]
-                profile = json.loads(profile_json)
+            if results["documents"] and results["documents"][0]:
+                profile_json = results["documents"][0]
+                profile = merge_preferences(None, json.loads(profile_json))
                 return profile
         except Exception as e:
-            print(f"프로필 로드 실패: {e}")
+            logger.warning("Profile load failed: %s", e)
 
         return None
 
-    def save_user_profile(self, user_id: str, preferences: Dict) -> bool:
+    def save_user_profile(self, user_id: str, preferences: dict) -> bool:
         """
         사용자 프로필을 ChromaDB에 저장 (Upsert)
 
@@ -259,15 +280,16 @@ class MemoryManager:
             저장 성공 여부
         """
         try:
+            preferences = merge_preferences(None, preferences)
             profile_id = f"profile_{user_id}"
             profile_json = json.dumps(preferences, ensure_ascii=False)
 
             # 프로필 텍스트를 임베딩 (향후 유사 사용자 검색용)
             profile_text = f"""
-            선호 카테고리: {', '.join(preferences.get('preferred_categories', []))}
-            선호 가격대: {preferences.get('price_preference', '')}
-            관심사: {', '.join(preferences.get('interests', []))}
-            기술 수준: {preferences.get('skill_level', '')}
+            선호 카테고리: {", ".join(preferences.get("preferred_categories", []))}
+            선호 가격대: {preferences.get("price_preference", "")}
+            관심사: {", ".join(preferences.get("interests", []))}
+            기술 수준: {preferences.get("skill_level", "")}
             """.strip()
 
             embedding = self._embed_text(profile_text)
@@ -277,94 +299,37 @@ class MemoryManager:
                 ids=[profile_id],
                 documents=[profile_json],
                 embeddings=[embedding],
-                metadatas=[{
-                    "user_id": user_id,
-                    "updated_at": datetime.now().isoformat()
-                }]
+                metadatas=[{"user_id": user_id, "updated_at": datetime.now().isoformat()}],
             )
 
             return True
         except Exception as e:
-            print(f"프로필 저장 실패: {e}")
+            logger.warning("Profile storage failed: %s", e)
             return False
 
     def extract_preferences(
-        self,
-        messages: List[Dict[str, str]],
-        existing_profile: Optional[Dict] = None
-    ) -> Dict:
-        """
-        대화 내용에서 사용자 선호도 추출 (Reflection)
-
-        Args:
-            messages: 대화 메시지 리스트
-            existing_profile: 기존 프로필 (있으면 병합)
-
-        Returns:
-            추출된 선호도 딕셔너리
-        """
-        # 대화 내용을 텍스트로 변환
-        conversation_text = "\n".join([
-            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-            for msg in messages
-        ])
-
-        # LLM으로 선호도 추출
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
-
-        system_prompt = """당신은 대화 분석 전문가입니다.
-주어진 대화 내용에서 사용자의 AI 도구 관련 선호도를 분석하세요.
-
-다음 JSON 형식으로만 응답하세요:
-{
-    "preferred_categories": ["카테고리1", "카테고리2"],
-    "price_preference": "무료선호/유료가능/비용무관",
-    "interests": ["관심분야1", "관심분야2"],
-    "skill_level": "초급/중급/고급",
-    "notes": "추가 메모"
-}
-
-카테고리 옵션: text-generation, image-generation, video-generation, audio-generation, code-generation, productivity, design, research
-"""
-
+        self, messages: list[dict[str, str]], existing_profile: dict | None = None
+    ) -> dict:
+        """Compatibility helper uses the same prompt and validation as Reflection."""
+        conversation = "\n".join(
+            f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages
+        )
         try:
-            response = llm.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"대화 내용:\n{conversation_text}")
-            ])
-
-            # JSON 파싱
-            response_text = response.content.strip()
-            # JSON 블록 추출
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0]
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0]
-
-            preferences = json.loads(response_text)
-
-            # 기존 프로필과 병합
-            if existing_profile:
-                merged = existing_profile.copy()
-                for key, value in preferences.items():
-                    if isinstance(value, list) and isinstance(merged.get(key), list):
-                        # 리스트는 합집합
-                        merged[key] = list(set(merged[key] + value))
-                    elif value:  # 새 값이 있으면 업데이트
-                        merged[key] = value
-                return merged
-
-            return preferences
-
-        except Exception as e:
-            print(f"선호도 추출 실패: {e}")
-            return existing_profile or {
-                "preferred_categories": [],
-                "price_preference": "비용무관",
-                "interests": [],
-                "skill_level": "중급",
-                "notes": ""
-            }
+            response = get_llm(temperature=0.3).invoke(
+                [
+                    SystemMessage(content=MEMORY_EXTRACTOR_SYSTEM_PROMPT),
+                    HumanMessage(
+                        content=MEMORY_EXTRACTOR_USER_TEMPLATE.format(
+                            conversation=conversation,
+                            existing_profile=json.dumps(existing_profile, ensure_ascii=False),
+                        )
+                    ),
+                ]
+            )
+            return merge_preferences(existing_profile, json.loads(extract_json(response.content)))
+        except Exception:
+            logger.warning("Could not extract preferences", exc_info=True)
+            return existing_profile or {}
 
     def get_tools_count(self) -> int:
         """저장된 AI 도구 수 반환"""
@@ -389,20 +354,21 @@ class MemoryManager:
         # 중복 방지 체크
         existing_count = self.pdf_collection.count()
         if existing_count > 0:
-            print(f"기존 {existing_count}개의 PDF 청크가 있습니다. 스킵합니다.")
+            logger.info("Reusing %s PDF chunks", existing_count)
             return existing_count
 
         # PDF 파일 탐색
         pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
         if not pdf_files:
-            print(f"PDF 파일을 찾을 수 없습니다: {pdf_dir}")
+            logger.info("No PDF files found in %s", pdf_dir)
             return 0
+
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from pypdf import PdfReader
 
         # 텍스트 스플리터 설정
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", ".", " ", ""]
+            chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", ".", " ", ""]
         )
 
         documents = []
@@ -412,28 +378,28 @@ class MemoryManager:
         for pdf_path in pdf_files:
             filename = os.path.basename(pdf_path)
             try:
-                loader = PyPDFLoader(pdf_path)
-                pages = loader.load()
+                pages = PdfReader(pdf_path).pages
 
-                for page in pages:
-                    page_num = page.metadata.get("page", 0)
-                    chunks = text_splitter.split_text(page.page_content)
+                for page_num, page in enumerate(pages):
+                    chunks = text_splitter.split_text(page.extract_text() or "")
 
                     for chunk_idx, chunk in enumerate(chunks):
                         if chunk.strip():
                             documents.append(chunk)
-                            metadatas.append({
-                                "source": "pdf",
-                                "filename": filename,
-                                "page": page_num,
-                                "chunk_idx": chunk_idx
-                            })
+                            metadatas.append(
+                                {
+                                    "source": "pdf",
+                                    "filename": filename,
+                                    "page": page_num,
+                                    "chunk_idx": chunk_idx,
+                                }
+                            )
                             ids.append(f"pdf_{filename}_{page_num}_{chunk_idx}")
 
-                print(f"PDF 로드 완료: {filename} ({len(pages)} 페이지)")
+                logger.info("Loaded %s (%s pages)", filename, len(pages))
 
             except Exception as e:
-                print(f"PDF 로드 실패 ({filename}): {e}")
+                logger.warning("PDF load failed (%s): %s", filename, e)
                 continue
 
         if not documents:
@@ -443,21 +409,13 @@ class MemoryManager:
         embeddings = self._embed_texts(documents)
 
         self.pdf_collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
+            documents=documents, embeddings=embeddings, metadatas=metadatas, ids=ids
         )
 
-        print(f"총 {len(documents)}개의 PDF 청크를 로드했습니다.")
+        logger.info("Indexed %s PDF chunks", len(documents))
         return len(documents)
 
-    def search_pdf_knowledge(
-        self,
-        query: str,
-        k: int = 3,
-        threshold: float = 0.03
-    ) -> List[Dict]:
+    def search_pdf_knowledge(self, query: str, k: int = 3, threshold: float = 0.03) -> list[dict]:
         """
         PDF 지식베이스 검색
 
@@ -470,32 +428,34 @@ class MemoryManager:
             검색 결과 리스트
         """
         # PDF 데이터가 없으면 빈 리스트 반환
-        if self.pdf_collection.count() == 0:
+        count = self.pdf_collection.count()
+        if count == 0:
             return []
 
         query_embedding = self._embed_text(query)
 
         results = self.pdf_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k
+            query_embeddings=[query_embedding], n_results=min(k, count)
         )
 
         search_results = []
-        if results['documents'] and results['documents'][0]:
-            for idx, doc in enumerate(results['documents'][0]):
-                distance = results['distances'][0][idx] if results['distances'] else 1.0
+        if results["documents"] and results["documents"][0]:
+            for idx, doc in enumerate(results["documents"][0]):
+                distance = results["distances"][0][idx] if results["distances"] else 1.0
                 # cosine distance를 유사도로 변환: similarity = 1 - distance
                 similarity = max(0, 1 - distance)
 
                 if similarity >= threshold:
-                    metadata = results['metadatas'][0][idx] if results['metadatas'] else {}
-                    search_results.append({
-                        "content": doc,
-                        "source": "pdf",
-                        "filename": metadata.get("filename", "Unknown"),
-                        "page": metadata.get("page", 0),
-                        "score": round(similarity, 3)
-                    })
+                    metadata = results["metadatas"][0][idx] if results["metadatas"] else {}
+                    search_results.append(
+                        {
+                            "content": doc,
+                            "source": "pdf",
+                            "filename": metadata.get("filename", "Unknown"),
+                            "page": metadata.get("page", 0),
+                            "score": round(similarity, 3),
+                        }
+                    )
 
         return search_results
 
@@ -519,7 +479,8 @@ class MemoryManager:
             관련도 점수 (0~1)
         """
         # PDF 데이터가 없으면 0 반환
-        if self.pdf_collection.count() == 0:
+        count = self.pdf_collection.count()
+        if count == 0:
             return 0.0
 
         # 도구명 + 카테고리로 검색 쿼리 구성
@@ -527,17 +488,16 @@ class MemoryManager:
         query_embedding = self._embed_text(query)
 
         results = self.pdf_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k
+            query_embeddings=[query_embedding], n_results=min(k, count)
         )
 
-        if not results['documents'] or not results['documents'][0]:
+        if not results["documents"] or not results["documents"][0]:
             return 0.0
 
         # 검색 결과의 유사도 점수 평균 계산
         scores = []
-        for idx, doc in enumerate(results['documents'][0]):
-            distance = results['distances'][0][idx] if results['distances'] else 1.0
+        for idx, _doc in enumerate(results["documents"][0]):
+            distance = results["distances"][0][idx] if results["distances"] else 1.0
             similarity = max(0, 1 - distance)
             scores.append(similarity)
 
@@ -548,11 +508,14 @@ class MemoryManager:
 
 # 메모리 매니저 싱글톤
 _memory_manager = None
+_memory_lock = Lock()
 
 
 def get_memory_manager() -> MemoryManager:
     """메모리 매니저 싱글톤 반환"""
     global _memory_manager
     if _memory_manager is None:
-        _memory_manager = MemoryManager()
+        with _memory_lock:
+            if _memory_manager is None:
+                _memory_manager = MemoryManager()
     return _memory_manager

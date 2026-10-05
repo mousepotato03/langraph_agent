@@ -1,7 +1,9 @@
 """
 Core LLM - LLM 팩토리 함수
 """
+
 from langchain_openai import ChatOpenAI
+
 from core.config import LLM_MODEL
 
 
@@ -15,4 +17,4 @@ def get_llm(temperature: float = 0.7) -> ChatOpenAI:
     Returns:
         ChatOpenAI 인스턴스
     """
-    return ChatOpenAI(model=LLM_MODEL, temperature=temperature)
+    return ChatOpenAI(model=LLM_MODEL, temperature=temperature, timeout=30, max_retries=2)

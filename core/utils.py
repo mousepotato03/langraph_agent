@@ -1,89 +1,50 @@
-"""
-Core Utils - 공통 유틸리티 함수
-"""
-import re
+"""Validation shared by model-output consumers."""
+
 import json
+import re
+
+from core.config import MAX_SUBTASKS
 
 
 def extract_json(text: str) -> str:
-    """LLM 응답에서 JSON을 안전하게 추출"""
-    text = text.strip()
-    
-    # 패턴 1: ```json ... ```
-    match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    # 패턴 2: ``` ... ```
-    match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    # 패턴 3: 그냥 JSON으로 시작하는 경우 - 첫 번째 완전한 JSON만 추출
-    if text.startswith('{') or text.startswith('['):
-        return _extract_first_valid_json(text)
-    
-    # 패턴 4: 텍스트 중간에 JSON이 있는 경우 - 첫 번째 완전한 JSON만 추출
-    # 객체 찾기
-    obj_match = re.search(r'\{', text)
-    # 배열 찾기
-    arr_match = re.search(r'\[', text)
-    
-    # 더 먼저 나오는 것부터 시도
-    if obj_match and (not arr_match or obj_match.start() < arr_match.start()):
-        return _extract_first_valid_json(text[obj_match.start():])
-    elif arr_match:
-        return _extract_first_valid_json(text[arr_match.start():])
-    
-    return text
+    """Extract the first complete JSON object/array, including fenced responses."""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\[{]", text):
+        try:
+            value, end = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return text[match.start() : match.start() + end]
+    raise ValueError("응답에 유효한 JSON 객체 또는 배열이 없습니다.")
 
 
-def _extract_first_valid_json(text: str) -> str:
-    """텍스트에서 첫 번째 유효한 JSON 객체/배열 추출"""
-    # 중괄호나 대괄호로 시작하는지 확인
-    if not (text.startswith('{') or text.startswith('[')):
-        return text
-    
-    # 브레이스 카운팅으로 첫 번째 완전한 JSON 찾기
-    brace_count = 0
-    bracket_count = 0
-    in_string = False
-    escape_next = False
-    
-    for i, char in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-            
-        if char == '\\':
-            escape_next = True
-            continue
-            
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-            
-        if in_string:
-            continue
-            
-        if char == '{':
-            brace_count += 1
-        elif char == '}':
-            brace_count -= 1
-        elif char == '[':
-            bracket_count += 1
-        elif char == ']':
-            bracket_count -= 1
-            
-        # 완전한 JSON 객체/배열을 찾았을 때
-        if brace_count == 0 and bracket_count == 0 and i > 0:
-            candidate = text[:i+1]
-            # 실제로 파싱 가능한지 검증
-            try:
-                json.loads(candidate)
-                return candidate
-            except:
-                continue
-    
-    # 완전한 JSON을 못 찾았으면 원본 반환
-    return text
+def validate_subtasks(value: object) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_SUBTASKS:
+        raise ValueError(f"계획은 1~{MAX_SUBTASKS}개의 작업이어야 합니다.")
+    tasks = []
+    for task in value:
+        description = task.get("description") if isinstance(task, dict) else task
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("각 작업에는 비어 있지 않은 설명이 필요합니다.")
+        tasks.append(description.strip())
+    return tasks
+
+
+def merge_preferences(existing: dict | None, new: object) -> dict:
+    """Store only the profile schema; keep list order stable across updates."""
+    if not isinstance(new, dict):
+        raise ValueError("선호도는 JSON 객체여야 합니다.")
+    merged = dict(existing or {})
+    for key in ("preferred_categories", "interests"):
+        values = new.get(key, [])
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise ValueError(f"{key}는 문자열 배열이어야 합니다.")
+        merged[key] = list(dict.fromkeys([*merged.get(key, []), *values]))
+    for key in ("price_preference", "skill_level", "notes"):
+        value = new.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"{key}는 문자열이어야 합니다.")
+        if value.strip():
+            merged[key] = value.strip()
+    return merged

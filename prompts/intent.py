@@ -19,12 +19,18 @@ INTENT_ANALYSIS_SYSTEM_PROMPT = """사용자의 자연어 응답에서 의도를
 3. **cancel**: 취소 의도
    - 예: "취소", "됐어", "그만", "안할래", "아니"
 
+4. **clarify**: 의도가 명확하지 않거나 계획에 대한 질문인 경우
+   - 예: "이 단계는 왜 필요해?", "음...", "잘 모르겠어"
+   - 명확한 승인 표현이 없으면 approve로 판단하지 마세요.
+
 ## 응답 형식 (JSON만 출력)
 {"intent": "approve", "feedback": ""}
 또는
 {"intent": "modify", "feedback": "수정 요청 상세 내용"}
 또는
 {"intent": "cancel", "feedback": ""}
+또는
+{"intent": "clarify", "feedback": ""}
 """
 
 INTENT_ANALYSIS_USER_TEMPLATE = """## 현재 계획

@@ -1,25 +1,27 @@
-"""
-Core Config - 전역 설정 및 상수 정의
-"""
+"""Environment configuration; default paths do not depend on the working directory."""
+
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 
-# LLM 설정
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-# RAG 설정
-SIMILARITY_THRESHOLD = 0.7
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 MAX_TOOL_CALLS_PER_TASK = 3
-
-# 저장소 경로
-DB_PATH = os.getenv("DB_PATH", "./db")
-DATA_PATH = os.getenv("DATA_PATH", "./data")
-
-# JSON 데이터 경로
-TOOLS_JSON_PATH = os.path.join(DATA_PATH, "ai_tools.json")
-
-# 서버 설정
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", 7860))
+MAX_SUBTASKS = 5
+SIMILARITY_THRESHOLD = 0.4
+# Upper bound: router + planning + approval + 5 * (3 tool pairs + finalization)
+# + guide + reflection, with room for a modified plan before re-approval.
+GRAPH_RECURSION_LIMIT = 80
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
+DB_PATH = os.getenv("DB_PATH", str(PROJECT_ROOT / "db"))
+DATA_PATH = os.getenv("DATA_PATH", str(PROJECT_ROOT / "data"))
+TOOLS_JSON_PATH = str(Path(DATA_PATH) / "ai_tools.json")
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "7860"))
